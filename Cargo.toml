@@ -1,0 +1,16 @@
+[package]
+name = "rtail"
+version = "0.1.0"
+authors = ["广泽 <guangzefrio@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+mio = "0.7"
+tokio = { version = "1", features = ["full"] }
+toml = "0.5.8"
+bytes = "1.0.1"
+log = "0.4"
+memchr = "2.3.4"
+futures = "0.3.2"
