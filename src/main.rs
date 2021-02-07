@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate lazy_static;
+
 use async_trait::async_trait;
 use bytes::BytesMut;
 use io::Result;
@@ -5,12 +8,18 @@ use memchr::memrchr;
 use std::io::SeekFrom;
 use tokio::fs::File;
 use tokio::io::{self, AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc::Receiver;
 use tokio::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+lazy_static! {
+    pub static ref STOP_CTRL: Arc<AtomicBool>  = Arc::new(AtomicBool::new(false));
+}
+
 const FLUSH_SECONDS: u64 = 1;
 const FLUSH_BATCH_BYTES: usize = 4 * 1024;
 const NEW_LINE_TERMINATOR: char = '\n';
+
 
 #[async_trait]
 trait ConsumeBytes {
