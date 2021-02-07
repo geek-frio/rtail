@@ -21,9 +21,7 @@ struct FlushRemote;
 #[async_trait]
 impl ConsumeBytes for FlushRemote {
     // Flush data to remote peer
-    async fn consume(&self, _: (&[u8], &[u8])) {
-        
-    }
+    async fn consume(&self, _: (&[u8], &[u8])) {}
 }
 
 #[tokio::main]
@@ -41,42 +39,38 @@ async fn main() -> io::Result<()> {
     return Ok(());
 }
 
-// Every time read one line data
-//
-// Batch cutting logic
-// 1. Time exceed and buf has at lease one line, 1 second
-// 2. Batch is bigger than 64KB we need to try to flush.
-// Overceed size line
-// If one line is very long, we will try to read all the one line data
 async fn loop_tail_new_log_data<T>(mut file: File, consume: T) -> io::Result<()>
 where
     T: ConsumeBytes,
 {
     // Seek to end of file
     let mut read_bytes: usize = 0;
+    // We use two buckets to temp buffer data
     let mut remain = BytesMut::with_capacity(FLUSH_BATCH_BYTES);
     let mut current = BytesMut::with_capacity(FLUSH_BATCH_BYTES);
-
-    let instant = Instant::now();
+    // Every FLUSH_SECONDS flush data to remote
+    let mut instant = Instant::now();
 
     loop {
         if read_bytes > FLUSH_BATCH_BYTES
             || (read_bytes > 0 && instant.elapsed() > Duration::from_secs(FLUSH_SECONDS))
         {
-            // seek last \n from back to first
-            // flush bytes from start to last '\n' idx
+            // Seek last \n from back to first // flush bytes from start to last '\n' idx
             if let Some(idx) = memrchr(NEW_LINE_TERMINATOR as u8, &current) {
                 let line_byts = current.split_to(idx);
-                // flush data to remote peer
+                // Flush data to remote peer
                 let l = &remain.as_ref()[0..remain.len()];
                 let r = &line_byts.as_ref()[0..line_byts.len()];
                 consume.consume((l, r)).await;
-                // swap remain and current
+                // Swap remain and current
                 remain.clear();
-                // remain bytes which is behind '\n' will be stored in remain
+                // Remain bytes which is behind '\n' will be stored in remain
                 let tmp = remain;
                 remain = current;
                 current = tmp;
+                // Status reset
+                read_bytes = 0;
+                instant = Instant::now();
             }
         }
         let size = file.read_buf(&mut current).await?;
@@ -92,13 +86,10 @@ async fn pop_file() -> Result<File> {
 mod tests {
     use super::ConsumeBytes;
     use async_trait::async_trait;
-    use bytes::Bytes;
     use core::time::Duration;
-    use memchr::memchr_iter;
     use rand::prelude::*;
     use std::future::Future;
-    use std::sync::Arc;
-    use std::{borrow::Borrow, io::SeekFrom};
+    use std::io::SeekFrom;
     use tokio::fs::File;
     use tokio::fs::OpenOptions;
     use tokio::io::AsyncSeekExt;
@@ -140,37 +131,45 @@ mod tests {
     #[async_trait]
     impl ConsumeBytes for NormalTest {
         async fn consume(&self, data: (&[u8], &[u8])) {
-            println!("{}{}", std::str::from_utf8(data.0).unwrap(), std::str::from_utf8(data.1).unwrap());
+            println!(
+                "{}{}",
+                std::str::from_utf8(data.0).unwrap(),
+                std::str::from_utf8(data.1).unwrap()
+            );
+            println!("\n\n\n=============\n");
         }
     }
 
     #[test]
     fn test_normal_read() {
-        let mut rng = rand::thread_rng();
         call_once(async {
             let (tx, rx) = mpsc::channel::<String>(100);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("./test/test_case.txt")
-                .await;
-            match file {
-                Ok(mut file) => {
-                    let _ = file.set_len(0).await;
-                    for _ in 0..1000 {
-                        let mut s = String::new();
-                        for i in 0..rng.next_u32() % 10000 {
-                            s.push((i % 255) as u8 as char);
+            tokio::spawn(async move {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("./test/test_case.txt")
+                    .await;
+                match file {
+                    Ok(mut file) => {
+                        let _ = file.set_len(0).await;
+                        for _ in 0..1000 {
+                            let mut s = String::new();
+                            for _ in 0..10000 {
+                                s.push('a');
+                            }
+                            s.push('E');
+                            s.push('\n');
+                            let _ = file.write(s.as_bytes()).await;
+                            let _ = tx.send(s).await;
                         }
-                        let _ = file.write(s.as_bytes()).await;
-                        let _ = tx.send("value".to_string()).await;
+                        let _ = tx.send("QUIT".to_string()).await;
                     }
-                    let _ = tx.send("QUIT".to_string()).await;
+                    Err(e) => {
+                        println!("{:?}", e)
+                    }
                 }
-                Err(e) => {
-                    println!("{:?}", e)
-                }
-            }
+            });
             tokio::spawn(async move {
                 sleep(Duration::from_secs(1)).await;
                 let normal_test = NormalTest { rx };
