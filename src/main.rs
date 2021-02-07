@@ -5,15 +5,16 @@ use memchr::memrchr;
 use std::io::SeekFrom;
 use tokio::fs::File;
 use tokio::io::{self, AsyncReadExt, AsyncSeekExt};
+use tokio::sync::mpsc::Receiver;
 use tokio::time::{Duration, Instant};
-
+use tokio::sync::mpsc;
 const FLUSH_SECONDS: u64 = 1;
 const FLUSH_BATCH_BYTES: usize = 4 * 1024;
 const NEW_LINE_TERMINATOR: char = '\n';
 
 #[async_trait]
 trait ConsumeBytes {
-    async fn consume(&self, data: (&[u8], &[u8]));
+    async fn consume(&mut self, data: (&[u8], &[u8]));
 }
 
 struct FlushRemote;
@@ -21,7 +22,7 @@ struct FlushRemote;
 #[async_trait]
 impl ConsumeBytes for FlushRemote {
     // Flush data to remote peer
-    async fn consume(&self, _: (&[u8], &[u8])) {}
+    async fn consume(&mut self, _: (&[u8], &[u8])) {}
 }
 
 #[tokio::main]
@@ -39,7 +40,10 @@ async fn main() -> io::Result<()> {
     return Ok(());
 }
 
-async fn loop_tail_new_log_data<T>(mut file: File, consume: T) -> io::Result<()>
+async fn loop_tail_new_log_data<T>(
+    mut file: File,
+    mut consume: T,
+) -> io::Result<()>
 where
     T: ConsumeBytes,
 {
@@ -86,10 +90,10 @@ async fn pop_file() -> Result<File> {
 mod tests {
     use super::ConsumeBytes;
     use async_trait::async_trait;
-    use core::time::Duration;
-    use rand::prelude::*;
     use std::future::Future;
     use std::io::SeekFrom;
+    use std::str::from_utf8;
+    use std::time::Duration;
     use tokio::fs::File;
     use tokio::fs::OpenOptions;
     use tokio::io::AsyncSeekExt;
@@ -103,40 +107,26 @@ mod tests {
         runtime.block_on(f)
     }
 
-    // unsafe use just for test
-    // async fn normal_read_check(ctx: Arc<Box<Context<Receiver<String>>>>, bytes: Bytes) {
-    //     unsafe {
-    //         let r = (ctx.t.borrow() as *const Receiver<String> as *mut Receiver<String>)
-    //             .as_mut()
-    //             .unwrap();
-    //         let m = memchr_iter('\n' as u8, &bytes);
-    //         let mut start_idx = 0;
-    //         for idx in m.into_iter() {
-    //             if idx == 0 {
-    //                 println!("skip");
-    //                 continue;
-    //             }
-    //             let as_slice = bytes.as_ref();
-    //             let ary = &as_slice[start_idx..idx];
-    //             start_idx = idx;
-    //             assert_eq!(std::str::from_utf8(ary).unwrap(), r.recv().await.unwrap());
-    //         }
-    //     };
-    // }
-
     struct NormalTest {
         rx: Receiver<String>,
     }
 
     #[async_trait]
     impl ConsumeBytes for NormalTest {
-        async fn consume(&self, data: (&[u8], &[u8])) {
-            println!(
+        async fn consume(&mut self, data: (&[u8], &[u8])) {
+            let s = format!(
                 "{}{}",
-                std::str::from_utf8(data.0).unwrap(),
-                std::str::from_utf8(data.1).unwrap()
+                from_utf8(data.0).unwrap(),
+                from_utf8(data.1).unwrap()
             );
-            println!("\n\n\n=============\n");
+            let iter = s.split('\n');
+            for x in iter {
+                if x.len() == 0 {
+                    continue;
+                }
+                let sent_s = self.rx.recv().await;
+                assert_eq!(sent_s.unwrap(), x);
+            }
         }
     }
 
@@ -144,6 +134,8 @@ mod tests {
     fn test_normal_read() {
         call_once(async {
             let (tx, rx) = mpsc::channel::<String>(100);
+            let (signal_tx, mut signal_rx) = mpsc::channel::<()>(1);
+            let s1 = signal_tx.clone();
             tokio::spawn(async move {
                 let file = OpenOptions::new()
                     .read(true)
@@ -161,7 +153,7 @@ mod tests {
                             s.push('E');
                             s.push('\n');
                             let _ = file.write(s.as_bytes()).await;
-                            let _ = tx.send(s).await;
+                            let _ = tx.send(s.trim_end().to_string()).await;
                         }
                         let _ = tx.send("QUIT".to_string()).await;
                     }
@@ -169,50 +161,59 @@ mod tests {
                         println!("{:?}", e)
                     }
                 }
+                let _ = s1.send(()).await;
             });
             tokio::spawn(async move {
-                sleep(Duration::from_secs(1)).await;
                 let normal_test = NormalTest { rx };
                 if let Ok(mut file) = File::open("./test/test_case.txt").await {
                     let _ = file.seek(SeekFrom::Start(0)).await;
                     let _ = super::loop_tail_new_log_data(file, normal_test).await;
                 }
             });
+            // wait to complete
+            signal_rx.recv().await;
+            sleep(Duration::from_secs(1)).await;
+        });
+    }
+    struct LongLineTest;
+
+    #[async_trait]
+    impl ConsumeBytes for LongLineTest {
+        async fn consume(&mut self, data: (&[u8], &[u8])) {}
+    }
+
+    #[test]
+    fn test_very_long_line() {
+        call_once(async {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("./test/test_case.txt")
+                .await;
+            match file {
+                Ok(mut file) => {
+                    let _ = file.set_len(0).await;
+                    let mut v = vec!['a' as u8; 1024 * 8];
+                    v[1024 * 8 - 1] = '\n' as u8;
+                    let new_line_data: &[u8] = &v;
+                    let _ = file.write_all(new_line_data).await;
+
+                    tokio::spawn(async {
+                        sleep(Duration::from_secs(1)).await;
+                        if let Ok(mut file) = File::open("./test/test_case.txt").await {
+                            let _ = file.seek(SeekFrom::Start(0)).await;
+                            let consumer = LongLineTest {};
+                            let _ = super::loop_tail_new_log_data(file, consumer).await;
+                        }
+                    });
+                }
+                Err(e) => {
+                    println!("{:?}", e)
+                }
+            }
             sleep(Duration::from_secs(6)).await;
         });
     }
-
-    //     #[test]
-    //     fn test_very_long_line() {
-    //         call_once(async {
-    //             let file = OpenOptions::new()
-    //                 .read(true)
-    //                 .write(true)
-    //                 .open("./test/test_case.txt")
-    //                 .await;
-    //             match file {
-    //                 Ok(mut file) => {
-    //                     let _ = file.set_len(0).await;
-    //                     let mut v = vec!['a' as u8; 1024 * 8];
-    //                     v[1024 * 8 - 1] = '\n' as u8;
-    //                     let new_line_data: &[u8] = &v;
-    //                     let _ = file.write_all(new_line_data).await;
-
-    //                     tokio::spawn(async {
-    //                         sleep(Duration::from_secs(1)).await;
-    //                         if let Ok(mut file) = File::open("./test/test_case.txt").await {
-    //                             let _ = file.seek(SeekFrom::Start(0)).await;
-    //                             let _ = super::loop_tail_new_log_data(file, read_long_line_check).await;
-    //                         }
-    //                     });
-    //                 }
-    //                 Err(e) => {
-    //                     println!("{:?}", e)
-    //                 }
-    //             }
-    //             sleep(Duration::from_secs(6)).await;
-    //         });
-    //     }
 
     //     #[test]
     //     fn test_loop_write_line_data_every_second() {
