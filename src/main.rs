@@ -1,8 +1,8 @@
-mod watch;
-
 #[macro_use]
 extern crate lazy_static;
+extern crate notify;
 
+mod watch;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use io::Result;
@@ -43,6 +43,7 @@ async fn main() -> io::Result<()> {
     let meta = file.metadata().await?;
     file.seek(SeekFrom::Start(meta.len())).await?;
 
+     
     // start to loop new data
     tokio::spawn(async move {
         let consume_byts = FlushRemote {};
