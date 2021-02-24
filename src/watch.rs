@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use walkdir::WalkDir;
-
+use notify::DebouncedEvent;
 macro_rules! regex_pattern {
     ($name:expr) => {
         $name
@@ -24,9 +24,14 @@ macro_rules! regex_pattern {
     };
 }
 
+enum TailPosition {
+    Start,
+    End,
+}
+
 struct LogFilesWatcher {
-    trace_files: Arc<Mutex<HashMap<String, ()>>>,
-    tx: UnboundedSender<String>,
+    trace_files: Arc<Mutex<HashMap<PathBuf, TailPosition>>>, 
+    tx: UnboundedSender<(PathBuf, TailPosition)>,
     dir_patterns: Vec<Regex>,
     file_patterns: Vec<Regex>,
     watching_dirs: Vec<PathBuf>,
@@ -36,10 +41,10 @@ impl LogFilesWatcher {
     fn init(
         dir_patterns: Vec<String>,
         file_patterns: Vec<String>,
-    ) -> (LogFilesWatcher, UnboundedReceiver<String>) {
+    ) -> (LogFilesWatcher, UnboundedReceiver<(PathBuf, TailPosition)>) {
         let dir_patterns = regex_pattern!(dir_patterns);
         let file_patterns = regex_pattern!(file_patterns);
-        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let (tx, rx) = mpsc::unbounded_channel::<(PathBuf, TailPosition)>();
         (
             LogFilesWatcher {
                 trace_files: Arc::new(Mutex::new(HashMap::new())),
@@ -54,7 +59,7 @@ impl LogFilesWatcher {
 
     fn watch_dir(&self, dir: PathBuf) {
         let watch_dir = dir.clone();
-        let tx = self.tx.clone();
+        let path_tx = self.tx.clone();
 
         // WE only care about newly created file
         thread::spawn(move || {
@@ -65,7 +70,13 @@ impl LogFilesWatcher {
                         let _ = watcher.watch(s, RecursiveMode::NonRecursive);
                         loop {
                             match rx.recv() {
-                                Ok(event) => println!("{:?}", event),
+                                Ok(event) => {
+                                    if let DebouncedEvent::Create(path) = event {
+                                        if let Ok(path) = canonicalize(path) {
+                                            let _ = path_tx.send((path, TailPosition::Start));
+                                        }
+                                    }
+                                },
                                 Err(e) => println!("watch error: {:?}", e),
                             }
                         }
@@ -76,24 +87,28 @@ impl LogFilesWatcher {
             for path in paths {
                 if let Ok(p) = path {
                     let res = p.file_type();
-                    if let Ok(ftype) = res {
+                    let _ = res.map(|ftype| {
                         if ftype.is_file() {
                             for r in self.file_patterns.iter() {
                                 let path = canonicalize(p.path().to_path_buf());
                                 if let Ok(path) = path {
+                                    let sent_path = path.clone();
                                     let path_str = path.to_str();
                                     if let Some(path_str) = path_str {
                                         if r.is_match(path_str) {
                                             let _ = self.trace_files.lock().map(|mut a| {
-                                                a.insert(path_str.to_string(), ());
-                                                let _ = self.tx.send(path_str.to_string());
+                                                if a.contains_key(&sent_path) {
+                                                    return;
+                                                }
+                                                a.insert(sent_path.clone(), TailPosition::End);
+                                                let _ = self.tx.send((sent_path, TailPosition::End));
                                             });
                                         }
                                     }
                                 }
                             }
                         }
-                    }
+                    });
                 }
             }
         });
