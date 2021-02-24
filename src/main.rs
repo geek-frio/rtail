@@ -43,7 +43,6 @@ async fn main() -> io::Result<()> {
     let meta = file.metadata().await?;
     file.seek(SeekFrom::Start(meta.len())).await?;
 
-     
     // start to loop new data
     tokio::spawn(async move {
         let consume_byts = FlushRemote {};
@@ -244,6 +243,9 @@ mod tests {
     #[async_trait]
     impl ConsumeBytes for LoopWriteLineDataTest {
         async fn consume(&mut self, data: (&[u8], &[u8])) {
+            let a = String::from("abc");
+            println!("af:{}", a);
+
             let s = format!(
                 "{}{}",
                 std::str::from_utf8(data.0).unwrap_or(""),
@@ -256,6 +258,7 @@ mod tests {
                 }
             }
             if self.times == 1000 {
+                println!("Times is already 1000");
                 super::STOP_CTRL.store(true, Ordering::Relaxed);
             }
         }
