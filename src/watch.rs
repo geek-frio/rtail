@@ -80,14 +80,16 @@ impl LogFilesWatcher {
                         if ftype.is_file() {
                             for r in self.file_patterns.iter() {
                                 let path = canonicalize(p.path().to_path_buf());
-                                let path_str = path
-                                    .map(|a| a.to_path_buf().to_str().unwrap().to_string())
-                                    .unwrap();
-                                if r.is_match(path_str.as_str()) {
-                                    let _ = self.trace_files.lock().map(|mut a| {
-                                        a.insert(path_str.clone(), ());
-                                        let _ = self.tx.send(path_str);
-                                    });
+                                if let Ok(path) = path {
+                                    let path_str = path.to_str();
+                                    if let Some(path_str) = path_str {
+                                        if r.is_match(path_str) {
+                                            let _ = self.trace_files.lock().map(|mut a| {
+                                                a.insert(path_str.to_string(), ());
+                                                let _ = self.tx.send(path_str.to_string());
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -111,7 +113,7 @@ impl LogFilesWatcher {
                             if let Ok(p) = path {
                                 let mut matched = false;
                                 for r in self.dir_patterns.iter() {
-                                    if r.is_match(p.to_str().unwrap()) {
+                                    if r.is_match(p.to_str().unwrap_or("")) {
                                         matched = true;
                                     }
                                 }
