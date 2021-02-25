@@ -1,8 +1,11 @@
+use notify::DebouncedEvent;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use std::fs;
 use std::fs::canonicalize;
+use std::io;
 use std::sync::mpsc::channel;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -12,7 +15,6 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use walkdir::WalkDir;
-use notify::DebouncedEvent;
 macro_rules! regex_pattern {
     ($name:expr) => {
         $name
@@ -30,7 +32,7 @@ enum TailPosition {
 }
 
 struct LogFilesWatcher {
-    trace_files: Arc<Mutex<HashMap<PathBuf, TailPosition>>>, 
+    trace_files: Arc<Mutex<HashMap<PathBuf, TailPosition>>>,
     tx: UnboundedSender<(PathBuf, TailPosition)>,
     dir_patterns: Vec<Regex>,
     file_patterns: Vec<Regex>,
@@ -57,61 +59,53 @@ impl LogFilesWatcher {
         )
     }
 
-    fn watch_dir(&self, dir: PathBuf) {
-        let watch_dir = dir.clone();
+    fn spawn_watcher(&self, watch_dir: PathBuf, notify: Sender<()>) -> Result<(), io::Error> {
         let path_tx = self.tx.clone();
-
-        // WE only care about newly created file
         thread::spawn(move || {
             let (tx, rx) = channel();
-            let _ =
-                Watcher::new(tx, Duration::from_secs(2)).map(|mut watcher: RecommendedWatcher| {
-                    watch_dir.to_str().map(|s| {
-                        let _ = watcher.watch(s, RecursiveMode::NonRecursive);
-                        loop {
-                            match rx.recv() {
-                                Ok(event) => {
-                                    if let DebouncedEvent::Create(path) = event {
-                                        if let Ok(path) = canonicalize(path) {
-                                            let _ = path_tx.send((path, TailPosition::Start));
-                                        }
-                                    }
-                                },
-                                Err(e) => println!("watch error: {:?}", e),
+            Watcher::new(tx, Duration::from_secs(2)).map(|mut watcher: RecommendedWatcher| {
+                watch_dir.to_str().map(|s| {
+                    watcher.watch(s, RecursiveMode::NonRecursive);
+                    // 进入watch通知扫描
+                    notify.send(());
+                    rx.iter().for_each(|event| {
+                        if let DebouncedEvent::Create(path) = event {
+                            if let Ok(path) = canonicalize(path) {
+                                let _ = path_tx.send((path, TailPosition::Start));
                             }
                         }
-                    });
+                    })
                 });
+            });
         });
-        let _ = fs::read_dir(dir).map(|paths| {
-            for path in paths {
-                if let Ok(p) = path {
-                    let res = p.file_type();
-                    let _ = res.map(|ftype| {
-                        if ftype.is_file() {
-                            for r in self.file_patterns.iter() {
-                                let path = canonicalize(p.path().to_path_buf());
-                                if let Ok(path) = path {
-                                    let sent_path = path.clone();
-                                    let path_str = path.to_str();
-                                    if let Some(path_str) = path_str {
-                                        if r.is_match(path_str) {
-                                            let _ = self.trace_files.lock().map(|mut a| {
-                                                if a.contains_key(&sent_path) {
-                                                    return;
-                                                }
-                                                a.insert(sent_path.clone(), TailPosition::End);
-                                                let _ = self.tx.send((sent_path, TailPosition::End));
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
+        Ok(())
+    }
+
+    fn watch_dir(&self, dir: PathBuf, rx: Receiver<()>) -> Result<(), io::Error> {
+        let _ = rx.recv();
+        let files = fs::read_dir(dir.clone())?
+            .filter_map(|dir_entry| dir_entry.ok())
+            .filter(|dir_entry| dir_entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter(|dir_entry| {
+                self.file_patterns.iter().any(|regex| {
+                    let path = canonicalize(dir_entry.path().to_path_buf());
+                    path.map_or(false, |v| v.to_str().map_or(false, |v| regex.is_match(v)))
+                })
+            });
+        let mut trace_files = self.trace_files.lock().unwrap();
+        let files: Vec<_> = files
+            .map(|dir_entry| dir_entry.path().to_path_buf())
+            .filter(|path_buf| !trace_files.contains_key(path_buf))
+            .collect();
+
+        for path_buf in files {
+            trace_files.insert(path_buf.clone(), TailPosition::End);
+            let sent = self.tx.send((path_buf, TailPosition::End));
+            if sent.is_err() {
+                todo!("interested file sent failed!");
             }
-        });
+        }
+        Ok(())
     }
 
     // Scan the root, recursive find all the directory
@@ -153,6 +147,7 @@ impl LogFilesWatcher {
 #[cfg(test)]
 mod tests {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+    use regex::bytes::Regex;
     use std::fs::canonicalize;
     use std::sync::mpsc::channel;
     use std::time::Duration;
@@ -182,5 +177,13 @@ mod tests {
             println!("file_name:{:?}", path);
             println!("=====");
         }
+    }
+
+    #[test]
+    fn test_files_scan() {
+        let dir_pattern = r".*?/app/logs/.*?";
+        let regex = Regex::new(dir_pattern).unwrap();
+        println!("{}", regex.is_match(b"/asfddsafa/adfasf/app/logs/asdfdasf"));
+        println!("{}", regex.is_match(b"adsfsfds/app"));
     }
 }
