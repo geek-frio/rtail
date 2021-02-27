@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use walkdir::WalkDir;
+
 macro_rules! regex_pattern {
     ($name:expr) => {
         $name
@@ -59,30 +60,45 @@ impl LogFilesWatcher {
         )
     }
 
-    fn spawn_watcher(&self, watch_dir: PathBuf, notify: Sender<()>) -> Result<(), io::Error> {
+    fn spawn_watcher_scan(&self, watch_dir: PathBuf) -> Result<(), io::Error> {
+        let (notify, waiter) = channel();
+        self.spawn_watcher(watch_dir.clone(), notify)?;
+        self.scan_files(watch_dir, waiter)?;
+        return Ok(());
+    }
+
+    fn spawn_watcher(&self, watch_dir: PathBuf, notify: Sender<bool>) -> Result<(), io::Error> {
         let path_tx = self.tx.clone();
         thread::spawn(move || {
             let (tx, rx) = channel();
-            Watcher::new(tx, Duration::from_secs(2)).map(|mut watcher: RecommendedWatcher| {
-                watch_dir.to_str().map(|s| {
-                    watcher.watch(s, RecursiveMode::NonRecursive);
-                    // 进入watch通知扫描
-                    notify.send(());
-                    rx.iter().for_each(|event| {
-                        if let DebouncedEvent::Create(path) = event {
-                            if let Ok(path) = canonicalize(path) {
-                                let _ = path_tx.send((path, TailPosition::Start));
-                            }
+            let watch_res =
+                Watcher::new(tx, Duration::from_secs(2)).map(|mut watcher: RecommendedWatcher| {
+                    watch_dir.to_str().map(|s| {
+                        if let Err(_) = watcher.watch(s, RecursiveMode::NonRecursive) {
+                            println!("watch dir:{:?} err", watch_dir);
                         }
-                    })
+                        let _ = notify.send(true);
+                        rx.iter().for_each(|event| {
+                            if let DebouncedEvent::Create(path) = event {
+                                if let Ok(path) = canonicalize(path) {
+                                    let _ = path_tx.send((path, TailPosition::Start));
+                                }
+                            }
+                        })
+                    });
                 });
-            });
+            if watch_res.is_err() {
+                let _ = notify.send(false);
+            }
         });
         Ok(())
     }
 
-    fn watch_dir(&self, dir: PathBuf, rx: Receiver<()>) -> Result<(), io::Error> {
-        let _ = rx.recv();
+    fn scan_files(&self, dir: PathBuf, rx: Receiver<bool>) -> Result<(), io::Error> {
+        // if spawn fail, not scan files in this directory
+        if !rx.recv().map_or_else(|_| false, |v| v) {
+            return Ok(());
+        }
         let files = fs::read_dir(dir.clone())?
             .filter_map(|dir_entry| dir_entry.ok())
             .filter(|dir_entry| dir_entry.file_type().map(|t| t.is_file()).unwrap_or(false))
@@ -113,36 +129,27 @@ impl LogFilesWatcher {
     // 2.List all the files below the matched directory, if the files match file pattern,
     //  send to the channel
     fn scan_and_watch(&self, root_dirs: Vec<String>) {
-        for root_dir in root_dirs {
-            for entry in WalkDir::new(root_dir.as_str()) {
-                match entry {
-                    Ok(entry) => {
-                        if entry.file_type().is_dir() {
-                            let path = canonicalize(entry.path().to_path_buf());
-                            if let Ok(p) = path {
-                                let mut matched = false;
-                                for r in self.dir_patterns.iter() {
-                                    if r.is_match(p.to_str().unwrap_or("")) {
-                                        matched = true;
-                                    }
-                                }
-                                if matched {
-                                    self.watch_dir(p);
-                                }
+        root_dirs
+            .iter()
+            .flat_map(|root_dir| WalkDir::new(root_dir.as_str()))
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_dir())
+            .for_each(|entry| {
+                let path = canonicalize(entry.path().to_path_buf());
+                path.into_iter().for_each(|path| {
+                    self.dir_patterns
+                        .iter()
+                        .filter(|r| r.is_match(path.to_str().unwrap_or("")))
+                        .for_each(|_| {
+                            let res = self.spawn_watcher_scan(path.clone());
+                            if let Err(e) = res {
+                                println!("spawn watch for path failed!path:{}", e);
                             }
-                        }
-                    }
-                    Err(e) => {
-                        println!("Have met error when scan, error:{:?}", e);
-                    }
-                }
-            }
-        }
+                        })
+                });
+            });
     }
 }
-
-// watch path
-// /var/lib/docker/overlay2/${container_id}/merged/app/logs
 
 #[cfg(test)]
 mod tests {
@@ -157,7 +164,6 @@ mod tests {
     fn test_file_watch() {
         let (tx, rx) = channel();
         let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_secs(2)).unwrap();
-
         let _ = watcher.watch("./test", RecursiveMode::NonRecursive);
         loop {
             match rx.recv() {
