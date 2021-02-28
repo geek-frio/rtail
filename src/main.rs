@@ -3,17 +3,26 @@ extern crate lazy_static;
 extern crate notify;
 
 mod watch;
+
 use async_trait::async_trait;
 use bytes::BytesMut;
-use io::Result;
+use futures::future;
+use futures::future::FutureExt;
+use futures::StreamExt;
 use memchr::memrchr;
+use std::io;
 use std::io::SeekFrom;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{self, AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, Instant};
+use watch::LogFilesWatcher;
+use watch::TailPosition;
 
 lazy_static! {
     pub static ref STOP_CTRL: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -38,17 +47,52 @@ impl ConsumeBytes for FlushRemote {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let mut file = pop_file().await?;
-    // seek to the correct position
-    let meta = file.metadata().await?;
-    file.seek(SeekFrom::Start(meta.len())).await?;
+    let (log_file_watcher, receiver) = LogFilesWatcher::init(vec![], vec![]);
 
-    // start to loop new data
-    tokio::spawn(async move {
-        let consume_byts = FlushRemote {};
-        let _ = loop_tail_new_log_data(file, consume_byts).await;
+    // Start scan task
+    // mock dir patterns, file_patterns
+    std::thread::spawn(move || {
+        log_file_watcher.scan_and_watch(vec!["./".to_string()]);
     });
+    // start to loop new data
+    watch_new_file_event(receiver).await;
     return Ok(());
+}
+
+async fn watch_new_file_event(mut receiver: UnboundedReceiver<(PathBuf, TailPosition)>) {
+    let handle = Handle::current();
+    loop {
+        let path_res = receiver.recv().await;
+        path_res.into_iter().for_each(|(path_buf, position)| {
+            // submit task to tokio runtime
+            handle.spawn(async move {
+                let consume_byts = FlushRemote {};
+
+                let mut file_vec: Vec<File> = File::open(path_buf.as_path())
+                    .into_stream()
+                    .filter(|file| future::ready(file.is_ok()))
+                    .map(|file| file.unwrap())
+                    .collect::<Vec<File>>()
+                    .await;
+                let file_o = file_vec.pop();
+                if let Some(mut file) = file_o {
+                    if position == TailPosition::End {
+                        let meta = file.metadata().await;
+                        if let Ok(meta) = meta {
+                            let r = file.seek(SeekFrom::Start(meta.len())).await;
+                            if r.is_err() {
+                                println!("seek fail, loop from start, path:{:?}", path_buf);
+                            }
+                        }
+                    }
+                    let res = loop_tail_new_log_data(file, consume_byts).await;
+                    if res.is_err() {
+                        println!("loop watch file:{:?} failed, err is {:?}", path_buf, res);
+                    }
+                }
+            });
+        });
+    }
 }
 
 async fn loop_tail_new_log_data<T>(mut file: File, mut consume: T) -> io::Result<()>
@@ -92,10 +136,6 @@ where
         read_bytes += size;
     }
     Ok(())
-}
-
-async fn pop_file() -> Result<File> {
-    return Ok(File::open("test.txt").await?);
 }
 
 #[cfg(test)]
