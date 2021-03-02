@@ -169,10 +169,55 @@ mod tests {
     use std::time::Duration;
     use walkdir::WalkDir;
 
+    macro_rules! custom_test {
+        (
+            #[test(timeout = $timeout:expr)]
+            $( #[$meta:meta] )*
+            fn $fname:ident $($rest:tt)*
+        ) => (
+            #[test]
+            $( #[$meta] )*
+            fn $fname() {
+                let (done_tx, done_rx) = ::std::sync::mpsc::channel();
+                let handle = ::std::thread::Builder::new()
+                    .name(
+                        concat!(module_path!(), "::", stringify!($fname))
+                        .splitn(2, "::").nth(1).unwrap()
+                        .into()
+                    )
+                    .spawn(move || {
+                        {
+                            fn $fname $($rest)*
+                            $fname()
+                        }
+                        let _ = done_tx.send(());
+                    })
+                    .unwrap();
+                match done_rx.recv_timeout({
+                    use ::std::time::*;
+                    $timeout
+                }) {
+                    | Err(::std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("Test took too long");
+                    },
+                    | _ => if let Err(err) = handle.join() {
+                        ::std::panic::resume_unwind(err);
+                    },
+                }
+            }
+        );
+
+        (
+            $($tt:tt)*
+        ) => (
+            $($tt)*
+        );
+    }
+
     #[test]
     fn test_scan_files() {
         let dir_patterns = vec![r".*?/app/logs/.*?".to_string()];
-        let file_patterns = vec![r".*?\.log".to_string()];
+        let file_patterns = vec![r".*?\.testlog".to_string()];
         let (log, mut rx) = LogFilesWatcher::init(dir_patterns, file_patterns);
         // spawn 信号通知
         let (s, r) = channel();
@@ -184,9 +229,11 @@ mod tests {
         // 发送扫描信息
         let _ = s.send(true);
         let _ = log.scan_files(path, r);
+        let mut collected_logs: Vec<String> = vec![];
         for _ in 0..3 {
             let res = rx.blocking_recv();
-            println!("res {:?}", res);
+            let path = res.unwrap().0;
+            collected_logs.push(path.to_str().unwrap().to_string());
         }
     }
 

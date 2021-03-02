@@ -75,6 +75,7 @@ async fn watch_new_file_event(mut receiver: UnboundedReceiver<(PathBuf, TailPosi
                     .collect::<Vec<File>>()
                     .await;
                 let file_o = file_vec.pop();
+
                 if let Some(mut file) = file_o {
                     if position == TailPosition::End {
                         let meta = file.metadata().await;
