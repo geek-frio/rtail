@@ -6,10 +6,9 @@ mod watch;
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use futures::future;
-use futures::future::FutureExt;
-use futures::StreamExt;
 use memchr::memrchr;
+use std::collections::HashMap;
+use std::fs::canonicalize;
 use std::io;
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -21,6 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, Instant};
+use watch::FileEvent;
 use watch::LogFilesWatcher;
 use watch::TailPosition;
 
@@ -52,44 +52,48 @@ async fn main() -> io::Result<()> {
     // Start scan task
     // mock dir patterns, file_patterns
     std::thread::spawn(move || {
-        log_file_watcher.scan_and_watch(vec!["./".to_string()]);
+        log_file_watcher.root_start(vec!["./".to_string()]);
     });
     // start to loop new data
     watch_new_file_event(receiver).await;
     return Ok(());
 }
 
-async fn watch_new_file_event(mut receiver: UnboundedReceiver<(PathBuf, TailPosition)>) {
+async fn seek_tail(path: PathBuf, pos: TailPosition) -> Result<(), io::Error> {
+    let mut file = File::open(path.as_path()).await?;
+    if pos == TailPosition::End {
+        file.seek(SeekFrom::End(0)).await?;
+    }
+    let consume_byts = FlushRemote {};
+    loop_tail_new_log_data(file, consume_byts).await?;
+    Ok(())
+}
+
+enum TailOperation {
+    Stop,
+}
+
+async fn watch_new_file_event(mut receiver: UnboundedReceiver<FileEvent>) {
     let handle = Handle::current();
+    let watching_files: HashMap<PathBuf, TailOperation> = HashMap::new();
+
     loop {
         let path_res = receiver.recv().await;
-        path_res.into_iter().for_each(|(path_buf, position)| {
+
+        // Receive new file which need to be take care of
+        path_res.into_iter().for_each(|file_event| {
+            //            match file_event {
+            //
+            //            }
             // submit task to tokio runtime
             handle.spawn(async move {
-                let consume_byts = FlushRemote {};
-
-                let mut file_vec: Vec<File> = File::open(path_buf.as_path())
-                    .into_stream()
-                    .filter(|file| future::ready(file.is_ok()))
-                    .map(|file| file.unwrap())
-                    .collect::<Vec<File>>()
-                    .await;
-                let file_o = file_vec.pop();
-
-                if let Some(mut file) = file_o {
-                    if position == TailPosition::End {
-                        let meta = file.metadata().await;
-                        if let Ok(meta) = meta {
-                            let r = file.seek(SeekFrom::Start(meta.len())).await;
-                            if r.is_err() {
-                                println!("seek fail, loop from start, path:{:?}", path_buf);
-                            }
-                        }
-                    }
-                    let res = loop_tail_new_log_data(file, consume_byts).await;
-                    if res.is_err() {
-                        println!("loop watch file:{:?} failed, err is {:?}", path_buf, res);
-                    }
+                let res = seek_tail(file_event.path.clone(), file_event.position).await;
+                if let Err(e) = res {
+                    println!(
+                        "Watch path:{:?}, error is:{:?}",
+                        canonicalize(file_event.path.clone()),
+                        e
+                    );
                 }
             });
         });
@@ -181,6 +185,32 @@ mod tests {
                 assert_eq!(sent_s.unwrap(), x);
             }
         }
+    }
+
+    struct BlankTest;
+
+    #[async_trait]
+    impl ConsumeBytes for BlankTest {
+        async fn consume(&mut self, _: (&[u8], &[u8])) {}
+    }
+
+    #[test]
+    fn test_delete_when_in_read() {
+        const FILE_NAME: &str = "./test/test_case.txt";
+        call_once(async {
+            let normal_test = BlankTest {};
+            std::thread::spawn(|| {
+                // wait for a while and then delete the file
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let remove_res = std::fs::remove_file(FILE_NAME);
+                println!("remove result is {:?}", remove_res);
+            });
+            if let Ok(mut file) = File::open(FILE_NAME).await {
+                let _ = file.seek(SeekFrom::Start(0)).await;
+                let res = super::loop_tail_new_log_data(file, normal_test).await;
+                println!("loop res is {:?}", res);
+            }
+        });
     }
 
     #[test]

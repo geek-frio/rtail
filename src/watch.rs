@@ -34,9 +34,22 @@ pub enum TailPosition {
     End,
 }
 
+#[derive(Debug)]
+pub enum FileEventType {
+    Create,
+    Delete,
+}
+
+#[derive(Debug)]
+pub struct FileEvent {
+    pub path: PathBuf,
+    pub position: TailPosition,
+    pub event_type: FileEventType,
+}
+
 pub struct LogFilesWatcher {
     trace_files: Arc<Mutex<HashMap<PathBuf, TailPosition>>>,
-    tx: UnboundedSender<(PathBuf, TailPosition)>,
+    tx: UnboundedSender<FileEvent>,
     dir_patterns: Vec<Regex>,
     file_patterns: Vec<Regex>,
     watching_dirs: Arc<Mutex<HashSet<PathBuf>>>,
@@ -46,10 +59,10 @@ impl LogFilesWatcher {
     pub fn init(
         dir_patterns: Vec<String>,
         file_patterns: Vec<String>,
-    ) -> (LogFilesWatcher, UnboundedReceiver<(PathBuf, TailPosition)>) {
+    ) -> (LogFilesWatcher, UnboundedReceiver<FileEvent>) {
         let dir_patterns = regex_pattern!(dir_patterns);
         let file_patterns = regex_pattern!(file_patterns);
-        let (tx, rx) = mpsc::unbounded_channel::<(PathBuf, TailPosition)>();
+        let (tx, rx) = mpsc::unbounded_channel::<FileEvent>();
         (
             LogFilesWatcher {
                 trace_files: Arc::new(Mutex::new(HashMap::new())),
@@ -62,10 +75,10 @@ impl LogFilesWatcher {
         )
     }
 
-    pub fn spawn_watcher_scan(&self, watch_dir: PathBuf) -> Result<(), io::Error> {
+    pub fn spawn_and_scan(&self, watch_dir: PathBuf) -> Result<(), io::Error> {
         let (notify, waiter) = channel();
-        self.spawn_watcher(watch_dir.clone(), notify)?;
-        self.scan_files(watch_dir.clone(), waiter)?;
+        self.dir_spawn(watch_dir.clone(), notify)?;
+        self.dir_scan(watch_dir.clone(), waiter)?;
         let watching_dirs = self.watching_dirs.lock().into_iter().next();
         if let Some(mut w) = watching_dirs {
             w.insert(watch_dir);
@@ -73,7 +86,7 @@ impl LogFilesWatcher {
         return Ok(());
     }
 
-    pub fn spawn_watcher(&self, watch_dir: PathBuf, notify: Sender<bool>) -> Result<(), io::Error> {
+    pub fn dir_spawn(&self, watch_dir: PathBuf, notify: Sender<bool>) -> Result<(), io::Error> {
         let path_tx = self.tx.clone();
         thread::spawn(move || {
             let (tx, rx) = channel();
@@ -84,12 +97,24 @@ impl LogFilesWatcher {
                             println!("watch dir:{:?} err", watch_dir);
                         }
                         let _ = notify.send(true);
-                        rx.iter().for_each(|event| {
-                            if let DebouncedEvent::Create(path) = event {
-                                if let Ok(path) = canonicalize(path) {
-                                    let _ = path_tx.send((path, TailPosition::Start));
-                                }
+                        rx.iter().for_each(|event| match event {
+                            DebouncedEvent::Create(path) => {
+                                let file_event = FileEvent {
+                                    path,
+                                    position: TailPosition::Start,
+                                    event_type: FileEventType::Create,
+                                };
+                                let _ = path_tx.send(file_event);
                             }
+                            DebouncedEvent::NoticeRemove(path) => {
+                                let file_event = FileEvent {
+                                    path,
+                                    position: TailPosition::Start,
+                                    event_type: FileEventType::Delete,
+                                };
+                                let _ = path_tx.send(file_event);
+                            }
+                            _ => {}
                         })
                     });
                 });
@@ -100,7 +125,7 @@ impl LogFilesWatcher {
         Ok(())
     }
 
-    pub fn scan_files(&self, dir: PathBuf, rx: Receiver<bool>) -> Result<(), io::Error> {
+    pub fn dir_scan(&self, dir: PathBuf, rx: Receiver<bool>) -> Result<(), io::Error> {
         // if spawn fail, not scan files in this directory
         if !rx.recv().map_or_else(|_| false, |v| v) {
             return Ok(());
@@ -123,7 +148,12 @@ impl LogFilesWatcher {
 
         for path_buf in files {
             trace_files.insert(path_buf.clone(), TailPosition::End);
-            let sent = self.tx.send((path_buf, TailPosition::End));
+            let file_event = FileEvent {
+                path: path_buf,
+                position: TailPosition::End,
+                event_type: FileEventType::Create,
+            };
+            let sent = self.tx.send(file_event);
             if sent.is_err() {
                 todo!("interested file sent failed!");
             }
@@ -135,7 +165,7 @@ impl LogFilesWatcher {
     // 1.If find a matched directory, watch it with create event, if new file is created send to the channel
     // 2.List all the files below the matched directory, if the files match file pattern,
     //  send to the channel
-    pub fn scan_and_watch(&self, root_dirs: Vec<String>) {
+    pub fn root_start(&self, root_dirs: Vec<String>) {
         root_dirs
             .iter()
             .flat_map(|root_dir| WalkDir::new(root_dir.as_str()))
@@ -148,7 +178,7 @@ impl LogFilesWatcher {
                         .iter()
                         .filter(|r| r.is_match(path.to_str().unwrap_or("")))
                         .for_each(|_| {
-                            let res = self.spawn_watcher_scan(path.clone());
+                            let res = self.spawn_and_scan(path.clone());
                             if let Err(e) = res {
                                 println!("spawn watch for path failed!path:{}", e);
                             }
@@ -164,12 +194,13 @@ mod tests {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     use regex::bytes::Regex;
     use std::fs::canonicalize;
+    use std::fs::File;
     use std::path::PathBuf;
     use std::sync::mpsc::channel;
     use std::time::Duration;
     use walkdir::WalkDir;
 
-    macro_rules! custom_test {
+    macro_rules! time_out_test{
         (
             #[test(timeout = $timeout:expr)]
             $( #[$meta:meta] )*
@@ -214,59 +245,115 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_scan_files() {
-        let dir_patterns = vec![r".*?/app/logs/.*?".to_string()];
-        let file_patterns = vec![r".*?\.testlog".to_string()];
-        let (log, mut rx) = LogFilesWatcher::init(dir_patterns, file_patterns);
-        // spawn 信号通知
-        let (s, r) = channel();
-
-        // 设置要进行scan的目录
-        let mut path = PathBuf::new();
-        path.push("./test/app/logs/");
-
-        // 发送扫描信息
-        let _ = s.send(true);
-        let _ = log.scan_files(path, r);
-        let mut collected_logs: Vec<String> = vec![];
-        for _ in 0..3 {
-            let res = rx.blocking_recv();
-            let path = res.unwrap().0;
-            collected_logs.push(path.to_str().unwrap().to_string());
-        }
+    macro_rules! init_watcher_test {
+        (dir: [$($d1:literal),+], files: [$($d2:literal),+]) => {
+            {
+                let mut dir_patterns = Vec::new();
+                $(
+                    dir_patterns.push($d1.to_string());
+                )+
+                let mut file_patterns = Vec::new();
+                $(
+                    file_patterns.push($d2.to_string());
+                )+
+                LogFilesWatcher::init(dir_patterns, file_patterns)
+            }
+        };
     }
 
-    #[test]
-    fn test_file_watch() {
-        let (tx, rx) = channel();
-        let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_secs(2)).unwrap();
-        let _ = watcher.watch("./test", RecursiveMode::NonRecursive);
-        loop {
-            match rx.recv() {
-                Ok(event) => println!("{:?}", event),
-                Err(e) => println!("watch error: {:?}", e),
+    time_out_test! {
+        #[test]
+        fn test_scan_files() {
+            let (log, mut rx) = init_watcher_test!(dir: [r".*?/app/logs/.*?"], files: [r".*?\.testlog"]);
+            let (s, r) = channel();
+            let mut path = PathBuf::new();
+            path.push("./test/app/logs/");
+
+            // 发送扫描信息
+            let _ = s.send(true);
+            let _ = log.dir_scan(path, r);
+            let mut collected_logs: Vec<String> = vec![];
+            let test_log_file_names = vec!["a.testlog", "b.testlog", "c.testlog"];
+            for _ in 0..3 {
+                let res = rx.blocking_recv();
+                let path = res.unwrap();
+                collected_logs.push(path.path.file_name().unwrap().to_str().unwrap().to_string());
+            }
+            for c in collected_logs {
+                println!("c is {:?}", c);
+                if !test_log_file_names.contains(&c.as_str()) {
+                    panic!("paniced");
+                }
             }
         }
     }
 
-    #[test]
-    fn test_walk_dir() {
-        for entry in WalkDir::new("./") {
-            let entry = entry.unwrap();
-            println!("=====");
-            println!("{}", entry.path().display());
-            let path = canonicalize(entry.path().to_path_buf());
-            println!("file_name:{:?}", path);
-            println!("=====");
+    time_out_test! {
+        #[test]
+        fn test_dir_spawn() -> Result<(), std::io::Error> {
+            let (watcher, mut rx) =
+                init_watcher_test!(dir: [r".*?/app/logs/.*?"], files: [r".*?\.testcreatelog"]);
+            let (s, r) = channel();
+            let mut path = PathBuf::new();
+            path.push("./test/app/logs/");
+
+            let _ = watcher.dir_spawn(path.clone(), s);
+            let _ = r.recv();
+
+            path.push("a");
+            path.set_extension("testcreatelog");
+            let _ = File::create(path.clone());
+            let new_path = rx.blocking_recv();
+
+            let res = std::panic::catch_unwind(move || {
+                println!("new path is:{:?}", new_path);
+                assert_eq!(new_path.unwrap().path.file_name().unwrap(), "a.testcreatelog");
+            });
+
+            let _ = std::fs::remove_file(path);
+            if res.is_err() {
+                panic!("panic");
+            }
+            Ok(())
         }
     }
 
-    #[test]
-    fn test_files_scan() {
-        let dir_pattern = r".*?/app/logs/.*?";
-        let regex = Regex::new(dir_pattern).unwrap();
-        println!("{}", regex.is_match(b"/asfddsafa/adfasf/app/logs/asdfdasf"));
-        println!("{}", regex.is_match(b"adsfsfds/app"));
+    time_out_test! {
+        #[test]
+        fn test_file_watch() {
+            let (tx, rx) = channel();
+            let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_secs(2)).unwrap();
+            let _ = watcher.watch("./test", RecursiveMode::NonRecursive);
+            loop {
+                match rx.recv() {
+                    Ok(event) => println!("{:?}", event),
+                    Err(e) => println!("watch error: {:?}", e),
+                }
+            }
+        }
+    }
+
+    time_out_test! {
+        #[test]
+        fn test_walk_dir() {
+            for entry in WalkDir::new("./") {
+                let entry = entry.unwrap();
+                println!("=====");
+                println!("{}", entry.path().display());
+                let path = canonicalize(entry.path().to_path_buf());
+                println!("file_name:{:?}", path);
+                println!("=====");
+            }
+        }
+    }
+
+    time_out_test! {
+        #[test]
+        fn test_files_scan() {
+            let dir_pattern = r".*?/app/logs/.*?";
+            let regex = Regex::new(dir_pattern).unwrap();
+            println!("{}", regex.is_match(b"/asfddsafa/adfasf/app/logs/asdfdasf"));
+            println!("{}", regex.is_match(b"adsfsfds/app"));
+        }
     }
 }
