@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, Instant};
 use watch::FileEvent;
 use watch::LogFilesWatcher;
@@ -73,30 +73,40 @@ enum TailOperation {
     Stop,
 }
 
+async fn process_file_event(
+    file_event: FileEvent,
+    watching: HashMap<PathBuf, UnboundedSender<TailOperation>>,
+) -> Result<(), std::io::Error> {
+    match file_event.event_type {
+        watch::FileEventType::Create => {
+            if watching_files.contains_key(&file_event.path) {
+                return;
+            }
+            let res = seek_tail(file_event.path.clone(), file_event.position).await;
+            if let Err(e) = res {
+                println!(
+                    "Watch path:{:?}, error is:{:?}",
+                    canonicalize(file_event.path.clone()),
+                    e
+                );
+            }
+        }
+        watch::FileEventType::Delete => {}
+    }
+    Ok(())
+}
+
 async fn watch_new_file_event(mut receiver: UnboundedReceiver<FileEvent>) {
     let handle = Handle::current();
-    let watching_files: HashMap<PathBuf, TailOperation> = HashMap::new();
+    let mut watching_files: HashMap<PathBuf, UnboundedSender<TailOperation>> = HashMap::new();
 
     loop {
         let path_res = receiver.recv().await;
 
         // Receive new file which need to be take care of
-        path_res.into_iter().for_each(|file_event| {
-            //            match file_event {
-            //
-            //            }
-            // submit task to tokio runtime
-            handle.spawn(async move {
-                let res = seek_tail(file_event.path.clone(), file_event.position).await;
-                if let Err(e) = res {
-                    println!(
-                        "Watch path:{:?}, error is:{:?}",
-                        canonicalize(file_event.path.clone()),
-                        e
-                    );
-                }
-            });
-        });
+        path_res
+            .into_iter()
+            .for_each(|file_event| match file_event.event_type {});
     }
 }
 
