@@ -8,18 +8,19 @@ use async_trait::async_trait;
 use bytes::BytesMut;
 use memchr::memrchr;
 use std::collections::HashMap;
-use std::fs::canonicalize;
 use std::io;
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, Instant};
+use tokio::{
+    fs::File,
+    sync::oneshot::{channel, Sender},
+};
 use watch::FileEvent;
 use watch::LogFilesWatcher;
 use watch::TailPosition;
@@ -55,7 +56,9 @@ async fn main() -> io::Result<()> {
         log_file_watcher.root_start(vec!["./".to_string()]);
     });
     // start to loop new data
-    watch_new_file_event(receiver).await;
+    let watch_res = watch_process_new_file(receiver).await;
+    if let Err(e) = watch_res {
+    println!("");
     return Ok(());
 }
 
@@ -75,38 +78,32 @@ enum TailOperation {
 
 async fn process_file_event(
     file_event: FileEvent,
-    watching: HashMap<PathBuf, UnboundedSender<TailOperation>>,
+    watching_files: &mut HashMap<PathBuf, Sender<TailOperation>>,
 ) -> Result<(), std::io::Error> {
     match file_event.event_type {
         watch::FileEventType::Create => {
             if watching_files.contains_key(&file_event.path) {
-                return;
+                return Ok(());
             }
-            let res = seek_tail(file_event.path.clone(), file_event.position).await;
-            if let Err(e) = res {
-                println!(
-                    "Watch path:{:?}, error is:{:?}",
-                    canonicalize(file_event.path.clone()),
-                    e
-                );
-            }
+            let (send, recv) = channel::<TailOperation>();
+            watching_files.insert(file_event.path.clone(), send);
+            seek_tail(file_event.path.clone(), file_event.position).await?;
+            let flush_remote = FlushRemote {};
+            let file = File::open(file_event.path).await?;
+            tokio::spawn(loop_tail_new_log_data(file, flush_remote));
         }
         watch::FileEventType::Delete => {}
     }
     Ok(())
 }
 
-async fn watch_new_file_event(mut receiver: UnboundedReceiver<FileEvent>) {
-    let handle = Handle::current();
-    let mut watching_files: HashMap<PathBuf, UnboundedSender<TailOperation>> = HashMap::new();
-
+async fn watch_process_new_file(mut receiver: UnboundedReceiver<FileEvent>) -> Result<(), io::Error> {
+    let mut watching_files: HashMap<PathBuf, Sender<TailOperation>> = HashMap::new();
     loop {
-        let path_res = receiver.recv().await;
-
-        // Receive new file which need to be take care of
-        path_res
-            .into_iter()
-            .for_each(|file_event| match file_event.event_type {});
+        let file_event = receiver.recv().await;
+        if let Some(file_event) = file_event {
+            process_file_event(file_event, &mut watching_files).await?;
+        }
     }
 }
 
