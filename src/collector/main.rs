@@ -57,7 +57,7 @@ async fn main() -> io::Result<()> {
     });
     // start to loop new data
     let watch_res = watch_process_new_file(receiver).await;
-    if let Err(e) = watch_res {
+    if let Err(e) = watch_res {}
     println!("");
     return Ok(());
 }
@@ -97,7 +97,9 @@ async fn process_file_event(
     Ok(())
 }
 
-async fn watch_process_new_file(mut receiver: UnboundedReceiver<FileEvent>) -> Result<(), io::Error> {
+async fn watch_process_new_file(
+    mut receiver: UnboundedReceiver<FileEvent>,
+) -> Result<(), io::Error> {
     let mut watching_files: HashMap<PathBuf, Sender<TailOperation>> = HashMap::new();
     loop {
         let file_event = receiver.recv().await;

@@ -4,11 +4,19 @@ version = "0.1.0"
 authors = ["广泽 <guangzefrio@gmail.com>"]
 edition = "2018"
 
+[[bin]]
+name = "collector"
+path = "src/collector/main.rs"
+
+[[bin]]
+name = "analyzer"
+path = "src/analyzer/main.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 mio = "0.7"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.4", features = ["full"] }
 toml = "0.5.8"
 bytes = "1.0.1"
 log = "0.4"
@@ -20,3 +28,12 @@ lazy_static = "1.4.0"
 notify = "4.0.15"
 walkdir = "2"
 regex = "1"
+tonic = "0.4"
+prost = "0.7"
+futures-util = "0.3"
+
+
+[build-dependencies]
+tonic-build = "0.4"
+
+
