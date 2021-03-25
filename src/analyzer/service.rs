@@ -1,6 +1,7 @@
 use super::collector::{CollectStatus, LineData, ShakeMeta, ShakeStatus};
-use super::common::AgentId;
+use super::common::*;
 use super::{LogCollector, LogCollectorServer};
+use futures_util::StreamExt;
 use tokio::sync::mpsc::unbounded_channel;
 use tonic::metadata::errors::ToStrError;
 use tonic::Code;
@@ -23,13 +24,20 @@ impl From<WrapStrError> for Status {
     }
 }
 
+impl From<LineData> for OriginErrData {
+    fn from(data: LineData) -> Self {
+        let bytes = data.linedata.into_bytes().as_slice().into();
+        OriginErrData { data: bytes }
+    }
+}
+
 impl CustomLogCollector {
     async fn init() -> CustomLogCollector {
         CustomLogCollector {}
     }
 
     fn get_agent_id<T>(request: &Request<T>) -> Result<Option<AgentId>, WrapStrError> {
-        let agent_id = request.metadata().get("agent_id");
+        let agent_id = request.metadata().get("agentid");
         if let Some(id) = agent_id {
             return Ok(Some(id.to_str()?.to_string()));
         }
@@ -44,40 +52,52 @@ impl LogCollector for CustomLogCollector {
         request: Request<tonic::Streaming<LineData>>,
     ) -> Result<Response<CollectStatus>, Status> {
         let agent_id = Self::get_agent_id(&request)?;
-        //return match agent_id {
-        //    None => Ok(Response::new(CollectStatus {
-        //        status: "false".to_string(),
-        //        description: "no agent_id set, not collected".to_string(),
-        //    })),
-        //    Some(agent_id) => {
-        //        if !self.processor_map.contains_key(&agent_id) {
-        //            let map = (*self.processor_map).clone();
-        //        }
-        //        let mut stream = request.into_inner();
-        //        while let Some(line_data) = stream.next().await {
-        //            let line_data = line_data?;
-        //            println!("line data:{:?}", line_data);
-        //        }
-        //        Ok(Response::new(CollectStatus {
-        //            status: "ok".to_string(),
-        //            description: "".to_string(),
-        //        }))
-        //    }
-        //};
-        return rpc_ok!(CollectStatus);
+        return match agent_id {
+            Some(agent_id) => {
+                let sender = AGENT_MAP.get(&agent_id);
+                match sender {
+                    Some(s) => {
+                        let mut stream = request.into_inner();
+                        while let Some(line_data) = stream.next().await {
+                            let origin = line_data?;
+                            let res = s.send(OriginErrData::from(origin));
+                            if let Err(e) = res {
+                                println!("send msg failed! err:{:?}", e.to_string());
+                            }
+                        }
+                        rpc_ok!(CollectStatus)
+                    }
+                    None => {
+                        rpc_err!("handshake should be made first", CollectStatus)
+                    }
+                }
+            }
+            None => {
+                rpc_err!(
+                    "agent id not exists, this log will be rejected",
+                    CollectStatus
+                )
+            }
+        };
     }
 
+    // Every time a new file is being watched, log agent will try to do handshake operation
     async fn hand_shake(
         &self,
         request: Request<ShakeMeta>,
     ) -> Result<Response<ShakeStatus>, Status> {
         let shake_meta = request.into_inner();
-        let mut map = AGENT_MAP.lock().await;
-        if map.contains_key(&shake_meta.agentid) {
+        if AGENT_MAP.contains_key(&shake_meta.agentid) {
             return rpc_ok!(ShakeStatus);
         }
-        let (sender, receiver) = unbounded_channel();
-        map.insert(shake_meta.agentid, sender);
+        let (sender, mut receiver) = unbounded_channel();
+        AGENT_MAP.insert(shake_meta.agentid, sender);
+
+        // we generate a job for each log agent
+        tokio::spawn(async move {
+            // do receving job
+            while let Some(_) = receiver.recv().await {}
+        });
         return rpc_ok!(ShakeStatus);
     }
 }
