@@ -11,7 +11,7 @@ pub type AgentId = String;
 pub type ErrorLogSender = UnboundedSender<OriginErrData>;
 
 pub struct OriginErrData {
-    data: BytesMut,
+    pub data: BytesMut,
 }
 
 lazy_static! {

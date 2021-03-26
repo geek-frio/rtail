@@ -91,12 +91,13 @@ impl LogCollector for CustomLogCollector {
             return rpc_ok!(ShakeStatus);
         }
         let (sender, mut receiver) = unbounded_channel();
-        AGENT_MAP.insert(shake_meta.agentid, sender);
+        AGENT_MAP.insert(shake_meta.agentid.clone(), sender);
 
         // we generate a job for each log agent
         tokio::spawn(async move {
+            let agentid = shake_meta.agentid;
             // do receving job
-            while let Some(_) = receiver.recv().await {}
+            while let Some(origin_data) = receiver.recv().await {}
         });
         return rpc_ok!(ShakeStatus);
     }
