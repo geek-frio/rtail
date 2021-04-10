@@ -8,9 +8,9 @@ use tonic::Code;
 use tonic::{Request, Response, Status};
 
 pub type AgentId = String;
-pub type ErrorLogSender = UnboundedSender<OriginErrData>;
+pub type ErrorLogSender = UnboundedSender<OriginLogData>;
 
-pub struct OriginErrData {
+pub struct OriginLogData {
     pub data: BytesMut,
 }
 

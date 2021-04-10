@@ -24,10 +24,10 @@ impl From<WrapStrError> for Status {
     }
 }
 
-impl From<LineData> for OriginErrData {
+impl From<LineData> for OriginLogData {
     fn from(data: LineData) -> Self {
         let bytes = data.linedata.into_bytes().as_slice().into();
-        OriginErrData { data: bytes }
+        OriginLogData { data: bytes }
     }
 }
 
@@ -60,7 +60,7 @@ impl LogCollector for CustomLogCollector {
                         let mut stream = request.into_inner();
                         while let Some(line_data) = stream.next().await {
                             let origin = line_data?;
-                            let res = s.send(OriginErrData::from(origin));
+                            let res = s.send(OriginLogData::from(origin));
                             if let Err(e) = res {
                                 println!("send msg failed! err:{:?}", e.to_string());
                             }
