@@ -4,13 +4,17 @@ version = "0.1.0"
 authors = ["广泽 <guangzefrio@gmail.com>"]
 edition = "2018"
 
-[[bin]]
-name = "collector"
-path = "src/collector/main.rs"
+#[[bin]]
+#name = "collector"
+#path = "src/collector/main.rs"
+#
+#[[bin]]
+#name = "analyzer"
+#path = "src/analyzer/main.rs"
 
 [[bin]]
-name = "analyzer"
-path = "src/analyzer/main.rs"
+name = "server"
+path = "src/server/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -28,13 +32,8 @@ lazy_static = "1.4.0"
 notify = "4.0.15"
 walkdir = "2"
 regex = "1"
-tonic = "0.4"
 prost = "0.7"
 futures-util = "0.3"
-dashmap = "4.0.2"
-
-
-[build-dependencies]
-tonic-build = "0.4"
-
+env_logger = "0.8"
+tokio-util = { version = "0.6.7", features = ["full"]}
 
